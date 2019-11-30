@@ -1,0 +1,1654 @@
+---
+title: "Code for Part A Paper"
+author: "Prithvi Acharya"
+date: "September 12, 2018"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+setwd("U:/PartA")
+library(dplyr)
+library(gbm)
+library(knitr)
+library(parallel)
+library(readr)
+library(ROCR)
+library(caret)
+
+
+```
+
+## 1. Raw Data Cleaning
+Raw data on every emission inspection conducted in Colorado between 2010-2017 has been provided in `r tsv` format - a pair of files for each calendar year. The following block combines the two files into one rectangular dataframe, and:
+* filters out only instances where both IM240 and OBD tests were conducted (assumes IM240 conducted if some result is recorded for at least one of three components; for OBD, assumes it was conducted if `r V_ONBOARD == 1`),
+* assign a unique serial number to each record,
+* calculate some general statistics on failure-rate etc.,
+* create a new variable for "IM240 Fail" (defined as failing any of the three components), and for "IM240 Pass" (defined as passing all three. 
+* and save the final dataframe as a `r .RData` file, to speed-up further analysis.
+
+```{r merge, echo = F}
+
+count <- 0 # count variable for assigning serial no.
+cy <- c(2010:2017)
+vtr.count <- vector(length = length(cy))
+both.count <- vector(length = length(cy))
+im240.frate <- vector(length = length(cy))
+im240.prate <- vector(length = length(cy))
+obd.frate <- vector(length = length(cy))
+mil.on.rate <- vector(length = length(cy))
+
+#dir.create("CO Raw Data/Merged")
+start.time <- Sys.time()
+for (i in 1:8){
+  #print progress statement
+  cat("\014")
+  print(paste0("Processing file #",i," of 8."))
+  print(difftime(Sys.time(),start.time))
+  
+  #grabbing the first file
+  vtr <- read_csv(file = paste0(
+    "U:/PartA/CO Raw Data/VTR/VTR",cy[i],".csv"),
+    col_names = TRUE, quote = "", trim_ws = TRUE)
+
+  vtr.count[i] <- nrow(vtr)
+  
+  #filtering out rows that didn't recieve OBD test
+  vtr <- filter(vtr, vtr$V_ONBOARD == 'Y')
+  
+  #filtering out rows which didn't recieve IM240
+  vtr <-  filter(vtr, is.na(vtr$V_NOX_RES) == FALSE |
+                   is.na(vtr$V_CO_RES) == FALSE |
+                   is.na(vtr$V_HC_RES) == FALSE)
+  
+  #grabbing the second file
+  vob <- read_csv(file = paste0(
+    "U:/PartA/CO Raw Data/VOB/VOB",cy[i],".csv"),
+    col_names = TRUE, quote = "", trim_ws = TRUE)
+  
+  
+  #merging the two tables
+  merged <- inner_join(vtr,vob,
+                    by = c("V_DATE_TIME","V_VIN"))
+  
+  #assigning unique serial no
+  sl.no <- c(1:nrow(merged))
+  sl.no <-  sl.no + count
+  count <- count + nrow(merged)
+  merged <- cbind (sl.no, merged)
+  
+  both.count[i] <- nrow(merged)
+  
+  #creating new boolean variables
+  merged$V_IM240_PASS <- merged$V_NOX_RES == 'P' &
+    merged$V_HC_RES == 'P'& merged$V_CO_RES == 'P'
+  
+  merged$V_IM240_FAIL <- merged$V_NOX_RES == 'F' |
+    merged$V_HC_RES == 'F'| merged$V_CO_RES == 'F'
+  
+  merged$V_OBD_FAIL <- 1 - (merged$V_OBD_RES == 'P')
+  
+  #calculating statistics
+  im240.prate[i] <- mean(merged$V_IM240_PASS, na.rm = TRUE)
+  im240.frate[i] <- mean(merged$V_IM240_FAIL, na.rm = TRUE)
+  obd.frate[i] <- mean(merged$V_OBD_FAIL, na.rm = TRUE)
+  mil.on.rate[i] <- mean(merged$V_OBD_MIL, na.rm = TRUE)
+  
+  #writing as RData file
+  save(merged, 
+       file = paste0("U:/PartA/CO Raw Data/Merged/merged_",
+                     cy[i],".RData"))
+}
+
+#writing the results table
+tbl1 <- cbind.data.frame(cy, vtr.count, 
+                         both.count,im240.frate, 
+                         im240.prate, obd.frate, 
+                         mil.on.rate)
+
+colnames(tbl1) <- c("Year","Total Tests", "Both Tests Conducted",
+                    "IM240 Fail Rate", "IM240 Pass Rate",
+                    "OBD Fail Rate", "OBD MIL On Rate")
+write_csv(tbl1, "Results/table1.csv")
+
+rm(list = ls())
+```
+
+## 2. Further Cleaning & Collating Into One File
+
+Now that a Sl. No. has been assigned to each row, I feel comfortable scrapping columns that we don't immediately require for the current analysis; if we need some data that was inadvertently left out, later, we can grab it by looking up the Sl No.
+
+The following code-block performs some further data cleaning activities, and merges all the data into one file after stripping away columns that are not required. Specific tasks are:
+
+* Removing unwanted columns,
+* Converting some columns to dummy variables,
+* Converting "Make" to "OEM"
+* Standardizing DTC's
+* Merging all eight files into one.
+
+
+```{r collate, echo = F}
+
+#reading the filenames
+merged.files <- dir(path = "CO Raw Data/Merged")
+
+#reading list of OEM's (see line 196)
+oem <- read_csv("veh_oem.csv")
+
+# function to "clean" DTC's and make them uniformly
+# five characters long; this function is called on 
+# in line #204.
+goodtrouble <- function (d) {
+  if(is.na(d) == FALSE){
+    d  <- as.character(d)
+    d  <- trimws(d)
+    first <- substr(d, 1,1)
+    lx <- nchar(d)
+    if(first == 'P'|first == 'U'|first == 'B'|first == 'C'){
+      return(d)
+    }
+    if(lx == 5){
+      return(d)
+    }
+    if(lx == 4)
+    {
+      d <- paste0("P",d)
+      return(d)
+    }
+    if(lx == 3){
+      d <- paste0("P0",d)
+      return(d)
+    }
+    else{
+      return(NA)
+    }
+  }
+  else{
+      return(NA)
+  }
+}
+start.time <- Sys.time()
+for(i in 1:length(merged.files)){
+  cat("\014")
+  print(paste0("Processing File #",i," of 8."))
+  print(difftime(Sys.time(),start.time))
+  load(paste0("CO Raw Data/Merged/",
+                       merged.files[i])) 
+  #loads df name "merged" for all years
+  short <- cbind.data.frame(merged$sl.no, 
+                            merged$V_DATE_TIME, merged$V_VIN,
+             merged$V_VEH_YEAR, merged$V_MAKE, merged$V_MODEL,
+             merged$V_VEH_TYPE, merged$V_CYLINDERS, merged$V_GVW,
+             merged$V_DISP, merged$V_TRANS, merged$V_ODOMETER,
+             merged$V_HC_STD, merged$V_CO_STD, merged$V_NOX_STD,
+             merged$V_HC_GRAMS, merged$V_CO_GRAMS, merged$V_NOX_GRAMS,
+             merged$V_HC_STD, merged$V_HC_RES,
+             merged$V_NOX_RES, merged$V_CO_RES,
+             merged$V_MPG, merged$V_OBD_RES, merged$V_OBD_MIL,
+             merged$V_IM240_FAIL, merged$V_IM240_PASS,
+             merged$V_OBD_FAIL, merged$V_TR_NO,     
+             merged$V_TR_CODE1, merged$V_TR_CODE2,
+             merged$V_TR_CODE3,merged$V_TR_CODE4, merged$V_TR_CODE5,
+             merged$V_TR_CODE6,merged$V_TR_CODE7, merged$V_TR_CODE8,
+             merged$V_TR_CODE9, merged$V_TR_CODE10, merged$V_TR_CODE11,
+             merged$V_TR_CODE12, merged$V_TR_CODE13,
+             merged$V_TR_CODE14, merged$V_TR_CODE15)
+  cn <- colnames(short)
+  cn <- substr(cn, 8, nchar(cn))
+  colnames(short) <- cn
+  rm(cn, merged)
+  
+  # converting text strings to  dummy variables
+  # and adding variable for "Age" = CY - MY + 1
+  short$V_AGE <- year(short$V_DATE_TIME) - 
+    short$V_VEH_YEAR + 1
+  short$V_TYPE_PASSENGER <- (short$V_VEH_TYPE == 'P') * 1
+  short$V_MANUAL <- (short$V_TRANS == 'M') * 1
+  short$V_IM240_FAIL <- short$V_IM240_FAIL * 1
+  short$V_IM240_PASS <- short$V_IM240_PASS * 1
+  short$V_NOX_RES <- 1 * (short$V_NOX_RES == 'F')
+  short$V_HC_RES <- 1 * (short$V_HC_RES == 'F')
+  short$V_CO_RES <- 1 * (short$V_CO_RES == 'F')
+  
+  # aggregating the "MAKE" to "MANUFACTURER" based on
+  # parent manufactuerer/OEM
+  where <- match(short$V_MAKE, oem$MAKE)
+  where[is.na(where) == TRUE] <-  34
+  short$V_OEM <- oem$PARENT[where]
+
+  # applying the function to standardize the look of the DTC's
+  cl <- makeCluster(detectCores())
+  short[,c(30:44)] <- parApply(cl,short[,c(30:44)], 
+                        c(1,2), goodtrouble)
+  stopCluster(cl)
+  
+  # removing redundant columns
+  short <- short[,c(1:4,  6, 48, 45:47, 8:44)]
+  
+  # collating to one file
+  if (i == 1){
+    collated <- short
+  }
+  
+  if (i > 1){
+    collated <- rbind(collated, short)
+  }
+}
+
+collated <- filter(collated, is.na(collated$V_OBD_FAIL) == F &
+                     is.na(collated$V_OBD_MIL) == F & 
+                     is.na(collated$V_IM240_FAIL) == F &
+                     is.na(collated$V_IM240_PASS) == F & 
+                     is.na(collated$V_NOX_RES) == F &
+                     is.na(collated$V_CO_RES) == F & 
+                     is.na(collated$V_HC_RES) == F)
+
+save(collated,
+     file = paste0("CO Raw Data/Cleaned/collated_all.RData"))
+
+rm(list = ls())
+
+```
+
+
+## 3. Dummy Variables
+
+In this block, we:
+* identify the most commonly occuring DTCs
+* create dummy variables for the 50 most commonly occuring of those DTCs
+
+
+```{r dummy, echo = F}
+
+load(paste0("CO Raw Data/Cleaned/collated_all.RData"))
+
+codes <- collated[,c(32:46)]
+
+# finding the most common  DTC's
+code <- codes[,1]
+for(i in 2:15){
+  code <- rbind (code, codes[i])
+}
+
+code <- filter(code, is.na(code) == FALSE)
+code.freq <- as.data.frame(table(code))
+colnames(code.freq) <- c("DTC","Occurences")
+code.freq <- code.freq[order(-code.freq$Occurences),]
+write_csv(code.freq, paste0("Results/table2.csv"))
+
+# getting the top n codes
+ndtc <- 50 #i.e. top 50 DTCs
+code.freq$DTC <- as.character(code.freq$DTC)
+dtcs <- code.freq$DTC[c(1:ndtc)]
+
+# making dummy vars
+cl <- makeCluster(detectCores())
+start.time <- Sys.time()
+for (i in 1:ndtc) {
+  this.code <- dtcs[i]
+  clusterExport(cl = cl, varlist = "this.code")
+  checkcode <- function(r) any(r %in% this.code)
+  cat("\014")
+  print(paste0("Adding Dummy Variable for ",this.code,
+               ". DTC #",i," of ",ndtc,"."))
+  print(difftime(Sys.time(),start.time))
+  ThisCol <- parApply(cl,codes, 1, checkcode)
+  ThisCol <- ThisCol * 1
+  collated <- cbind(collated, ThisCol)
+  cn <- colnames(collated)
+  cn[length(cn)]  <- this.code
+  colnames(collated) <- cn
+  rm(cn)
+}
+stopCluster(cl)
+
+save(collated, 
+     file = "CO Raw Data/Cleaned/all_50DTC.RData")
+
+# this is a 4GB file. Sigh.
+rm(list = ls())
+
+```
+
+## 4. OBD-II MIL as a predictor
+
+In this block, we evaluate (using `r confusionMatrix()`) the OBD-II MIL as a predictor of IM240 failure overall, and as a predictor of individual components. Also:
+
+* filtering out some rows with NA values for individual predictors (because of blank/NA values in the raw data,
+or div/0 etc. most likely these tests were not conducted or were badly recorded)
+
+Note here *AND EVERYWHERE HEREAFTER* a _positive result means a pass_.
+
+```{r obd-confusion}
+
+load("CO Raw Data/Cleaned/collated_all.RData")
+
+yhat <- as.factor(as.integer(collated$V_OBD_MIL))
+# OBD MIL as a predictor of failing the OBD test 
+# this is counter-intuitive, but is mostly a measure of 
+# readiness etc to show that their impact is minor
+y1 <- as.factor(as.integer(collated$V_OBD_FAIL))
+cm1 <- confusionMatrix(table(yhat,y1), 
+                       positive = "0")
+write.csv(cm1$table, "Results/table3-1.csv")
+tocsv <- data.frame(cbind(t(cm1$overall),
+                          t(cm1$byClass)))
+tocsv <- data.frame(t(tocsv))
+write.csv(tocsv,"Results/table3-2.csv")
+
+
+# OBD MIL as a predictor of overall IM240 result
+y2 <- as.factor(collated$V_IM240_FAIL)
+cm2 <- confusionMatrix(table(yhat,y2), positive = "0")
+write.csv(cm2$table, "Results/table4-1.csv")
+tocsv <- data.frame(cbind(t(cm2$overall),
+                          t(cm2$byClass)))
+tocsv <- data.frame(t(tocsv))
+write.csv(tocsv,"Results/table4-2.csv")
+
+
+# OBD MIL as a predictor of HC Component Result
+y3 <- as.factor(collated$V_HC_RES)
+cm3 <- confusionMatrix(table(yhat, y3), positive = "0")
+percabove <- (collated$V_HC_GRAMS - collated$V_HC_STD)/(
+  collated$V_HC_STD) * 100 #%
+write.csv(cm3$table, "Results/table5-1.csv")
+tocsv <- data.frame(cbind(t(cm3$overall),
+                          t(cm3$byClass)))
+tocsv <- data.frame(t(tocsv))
+write.csv(tocsv,"Results/table5-2.csv")
+
+histIM240fail <- filter(as.data.frame(percabove),
+                        y3 == "1")
+histfailboth <- filter(as.data.frame(percabove),
+                       y3 == "1" & yhat == "1")
+histOBDfalsepass <- filter(as.data.frame(percabove), 
+                           yhat == "0" & y3 == "1")
+
+
+postscript("Results/Figure1.eps")
+par(mfrow = c(1, 3))
+hist(as.numeric(histIM240fail$percabove),
+     xlab = "Percent Above HC Standard (%)",
+     main = "All IM240 HC Fails",
+     breaks = "Scott",
+     xlim = c(0,1500),
+     cex.lab = 1.5,
+     cex.axis = 1.5)
+
+hist(as.numeric(histOBDfalsepass$percabove),
+     xlab = "Percent Above HC Standard (%)",
+     main = "OBD False Pass",
+     breaks = "Scott",
+     ylab = "",
+     xlim = c(0,1500),
+     cex.lab = 1.5,
+     cex.axis = 1.5)
+
+hist(as.numeric(histfailboth$percabove),
+     xlab = "Percent Above HC Standard (%)",
+     main = "OBD Correctly Identified Fails",
+     breaks = "Scott",
+     ylab = "",
+     xlim = c(0,1500),
+     cex.lab = 1.5,
+     cex.axis = 1.5)
+
+dev.off()
+
+
+
+# OBD MIL as a predictor of CO Component Result
+y3 <- as.factor(collated$V_CO_RES)
+cm3 <- confusionMatrix(table(yhat, y3), positive = "0")
+percabove <- (collated$V_CO_GRAMS - collated$V_CO_STD)/(
+  collated$V_CO_STD) * 100 #%
+write.csv(cm3$table, "Results/table6-1.csv")
+tocsv <- data.frame(cbind(t(cm3$overall),
+                          t(cm3$byClass)))
+tocsv <- data.frame(t(tocsv))
+write.csv(tocsv,"Results/table6-2.csv")
+
+histIM240fail <- filter(as.data.frame(percabove),
+                        y3 == "1")
+histfailboth <- filter(as.data.frame(percabove),
+                       y3 == "1" & yhat == "1")
+histOBDfalsepass <- filter(as.data.frame(percabove), 
+                           yhat == "0" & y3 == "1")
+
+
+postscript("Results/Figure2.eps")
+par(mfrow = c(1, 3))
+hist(as.numeric(histIM240fail$percabove),
+     xlab = "Percent Above CO Standard (%)",
+     main = "All IM240 CO Fails",
+     breaks = "Scott",
+     xlim = c(0,300),
+     cex.lab = 1.5,
+     cex.axis = 1.5)
+
+hist(as.numeric(histOBDfalsepass$percabove),
+     xlab = "Percent Above CO Standard (%)",
+     main = "OBD False Pass",
+     breaks = "Scott",
+     ylab = "",
+     xlim = c(0,300),
+     cex.lab = 1.5,
+     cex.axis = 1.5)
+
+hist(as.numeric(histfailboth$percabove),
+     xlab = "Percent Above CO Standard (%)",
+     main = "OBD Correctly Identified Fails",
+     breaks = "Scott",
+     ylab = "",
+     xlim = c(0,300),
+     cex.lab = 1.5,
+     cex.axis = 1.5)
+
+dev.off()
+
+
+# OBD MIL as a predictor of NOX Component Result
+y3 <- as.factor(collated$V_NOX_RES)
+cm3 <- confusionMatrix(table(yhat, y3), positive = "0")
+percabove <- (collated$V_NOX_GRAMS - collated$V_NOX_STD)/(
+  collated$V_NOX_STD) * 100 #%
+write.csv(cm3$table, "Results/table7-1.csv")
+tocsv <- data.frame(cbind(t(cm3$overall),
+                          t(cm3$byClass)))
+tocsv <- data.frame(t(tocsv))
+write.csv(tocsv,"Results/table7-2.csv")
+
+histIM240fail <- filter(as.data.frame(percabove),
+                        y3 == "1")
+histfailboth <- filter(as.data.frame(percabove),
+                       y3 == "1" & yhat == "1")
+histOBDfalsepass <- filter(as.data.frame(percabove), 
+                           yhat == "0" & y3 == "1")
+
+
+postscript("Results/Figure3.eps")
+par(mfrow = c(1, 3))
+hist(as.numeric(histIM240fail$percabove),
+     xlab = "Percent Above NOX Standard (%)",
+     main = "All IM240 NOX Fails",
+     breaks = "Scott",
+     xlim = c(0,300),
+     cex.lab = 1.5,
+     cex.axis = 1.5)
+
+hist(as.numeric(histOBDfalsepass$percabove),
+     xlab = "Percent Above NOX Standard (%)",
+     main = "OBD False Pass",
+     breaks = "Scott",
+     ylab = "",
+     xlim = c(0,300),
+     cex.lab = 1.5,
+     cex.axis = 1.5)
+
+hist(as.numeric(histfailboth$percabove),
+     xlab = "Percent Above NOX Standard (%)",
+     main = "OBD Correctly Identified Fails",
+     breaks = "Scott",
+     ylab = "",
+     xlim = c(0,300),
+     cex.lab = 1.5,
+     cex.axis = 1.5)
+
+dev.off()
+
+
+rm(list = ls())
+```
+
+# 5. Summary Stats
+Since we're already here, we should probably get some other basic summary stats.
+
+* Vehicle Make
+* Test Fail Combinations
+* Vehicle Year and Age, etc.
+
+```{r summary}
+
+load("CO Raw Data/Cleaned/collated_all.RData")
+
+tab <- table(collated$V_OEM)
+tab <- data.frame(tab)
+write_csv(tab, "Results/Table8.csv")
+
+t2 <- summarise(group_by(collated,V_OBD_MIL, V_IM240_FAIL, V_CO_RES,
+                                     V_NOX_RES,V_HC_RES),count =n())
+write_csv(t2, "Results/Table9.csv")
+
+rm(list = ls())
+
+```
+
+
+## 6. Stratification
+
+Creating a 50-50 stratified dataset for use in model development.
+
+```{r strat}
+
+load("CO Raw Data/Cleaned/all_50DTC.RData")
+
+#split into those passing and those failing IM240
+pass <- filter(collated, collated$V_IM240_FAIL == 0)
+fail <- filter(collated, collated$V_IM240_FAIL == 1)
+rm(collated)
+
+set.seed(534)
+# 50% fail-rate stratifid sample
+pass <- sample_n(pass, 200000)
+fail <- sample_n(fail, 200000)
+
+stratified <- rbind(pass,fail)
+stratified <- sample_n(stratified,
+                       400000)
+save(stratified, 
+     file = "CO Raw Data/Cleaned/50DTC_50Percent.RData")
+
+rm(list = ls())
+```
+
+## 7. Logistic Regression
+
+This chunk splits the dataset into two chunks for training and testing - 70% and 30% respectively.
+
+```{r logreg}
+
+load("CO Raw Data/Cleaned/50DTC_50Percent.RData")
+
+#splitting data into training and testing sets
+br <- rep(c(1:10),length.out = nrow(stratified))
+set.seed(100)
+br <- sample(br)
+train <- dplyr::filter(stratified, br <=  7)
+test <- dplyr::filter(stratified, br > 7)
+
+# identifying regressors
+cn <- colnames(stratified)
+ncode <- 50  #how many DTC's to include
+cn <- cn[c(6:12,14,25,31,47:(46+ncode),27)]
+
+# adding  interaction terms
+cn1 <-  c(cn, "V_ODOMETER/V_AGE",
+         "V_OEM * V_TR_NO","V_OEM * V_AGE")
+
+#selecting regressors for other models
+cn2 <-  cn1[c(2:60,62)] #without MIL or OEM
+cn3 <- cn1[c(10:60)] #DTC's ONLY
+
+# regression equation
+fml.logreg1 <- as.formula(paste0(
+  "V_IM240_FAIL ~ ",paste0(cn1, collapse = "+")))
+fml.logreg2 <- as.formula(paste0(
+  "V_IM240_FAIL ~ ",paste0(cn2, collapse = "+")))
+fml.logreg3 <- as.formula(paste0(
+  "V_IM240_FAIL ~ ",paste0(cn3, collapse = "+")))
+
+
+# using cross-validation to tune the model
+splt <- rep(c(1:5), length.out = nrow(train))
+set.seed(400)
+splt <- sample(splt)
+y <- vector(length = 0)
+yhat1 <- vector(length = 0)
+yhat2 <- vector(length = 0)
+yhat3 <- vector(length = 0)
+
+for (i in 1:5){
+  cv.trn <- filter(train, splt != i)
+  cv.test <- filter(train, splt == i)
+  y <- c(y,cv.test$V_IM240_FAIL)
+  logreg1 <- glm(fml.logreg1, data = cv.trn,
+                     family = binomial(link = "logit"))
+  logreg2 <- glm(fml.logreg2, data = cv.trn,
+                     family = binomial(link = "logit"))
+  logreg3 <- glm(fml.logreg3, data = cv.trn,
+                     family = binomial(link = "logit"))
+  yhat1 <- c(yhat1, predict(logreg1, newdata = cv.test,
+                            type = "response"))
+  yhat2 <- c(yhat2, predict(logreg2, newdata = cv.test,
+                            type = "response"))
+  yhat3 <- c(yhat3, predict(logreg3, newdata = cv.test,
+                            type = "response"))
+}
+
+
+# Function to identify cutpoint.
+opt.cut = function(perf, pred){
+  cut.ind = mapply(FUN=function(x, y, p){
+    d = (x - 0)^2 + (y-1)^2
+    ind = which(d == min(d))
+    c(sensitivity = y[[ind]], specificity = 1-x[[ind]], 
+      cutoff = p[[ind]])
+  }, perf@x.values, perf@y.values, pred@cutoffs)
+}
+
+
+#Calculating AUC parameters & plotting Model I
+yhat <- yhat1
+error <- prediction(yhat, y)
+perf <- performance(error, measure="tpr", x.measure="fpr")
+AUC1 <- performance(error, measure = "auc")
+AUC1 <- as.numeric(AUC1@y.values)
+cutpoint <-  as.data.frame(
+  opt.cut(perf,error))[3,1]
+
+yhatcm <- as.factor((yhat >= cutpoint)*1)
+ycm <- as.factor(y)
+c1 <- confusionMatrix(yhatcm, ycm,
+                     positive = "1")
+# postscript("Results/Figure4.eps")
+# par(mfrow = c(1,1))
+plot(perf, 
+     main = "Logistic Regression Model: Cross-Validated ROC Curve",
+     avg = 'threshold', 
+     spread.estimate = 'stddev',
+     print.cutoffs.at = seq(0.3,
+                            0.7, 
+                            by = 0.1),
+     text.adj = c(-.5, 1.2), 
+     xlab = "Average False Positive ID Rate", 
+     ylab = "Average True Positive ID Rate",
+     col = "blue",
+     cex = 1.3, 
+     cex.axis = 1.3,
+     cex.lab = 1.3) 
+abline(0, 1) 
+
+#Calculating AUC parameters & plotting Model II
+yhat <- yhat2
+error <- prediction(yhat, y)
+perf <- performance(error, measure="tpr", x.measure="fpr")
+AUC2 <- performance(error, measure = "auc")
+AUC2 <- as.numeric(AUC2@y.values)
+cutpoint <-  as.data.frame(
+  opt.cut(perf,error))[3,1]
+
+yhatcm <- as.factor((yhat >= cutpoint)*1)
+ycm <- as.factor(y)
+c2 <- confusionMatrix(yhatcm, ycm,
+                     positive = "1")
+
+plot(perf, 
+     add = TRUE,
+     avg = 'threshold', 
+     spread.estimate = 'stddev',
+     col = "green") 
+
+#Calculating AUC parameters & plotting Model III
+yhat <- yhat3
+error <- prediction(yhat, y)
+perf <- performance(error, measure="tpr", x.measure="fpr")
+AUC3 <- performance(error, measure = "auc")
+AUC3 <- as.numeric(AUC3@y.values)
+cutpoint <-  as.data.frame(
+  opt.cut(perf,error))[3,1]
+
+yhatcm <- as.factor((yhat >= cutpoint)*1)
+ycm <- as.factor(y)
+c3 <- confusionMatrix(yhatcm, ycm,
+                     positive = "0")
+plot(perf, 
+     add = TRUE,
+     avg = 'threshold', 
+     spread.estimate = 'stddev',
+     col = "red") 
+
+
+points(x = 0.11, y = 0.45, pch = 18, cex = 1.8)
+text(x= 0.18, y = 0.45, labels = "OBD-MIL")
+
+abline(h = 0.45, lty = 3)
+abline(v = 0.11, lty = 3)
+#dev.off()
+
+
+legend(0.8, 0.2, legend=c("Model I", "ModelII", "Model III"),
+       col = c("green", "blue", "red"), lty = 1)
+
+rm(list = ls())
+
+```
+
+## 8. Model II - GBM
+
+```{r gbm1}
+
+load("CO Raw Data/Cleaned/50DTC_50Percent.RData")
+
+#splitting data into training and testing sets
+br <- rep(c(1:10),length.out = nrow(stratified))
+set.seed(100)
+br <- sample(br)
+stratified$V_OEM <- as.factor(stratified$V_OEM)
+train <- dplyr::filter(stratified, br <=  7)
+test <- dplyr::filter(stratified, br > 7)
+
+# identifying regressors
+cn <- colnames(stratified)
+rm(stratified)
+ncode <- 50  #how many DTC's to include
+cn <- cn[c(6:10,12,14,25,31,47:(46+ncode))]
+
+
+fml.gbm1 <- as.formula(paste0(
+  "V_IM240_FAIL ~ ",paste0(cn, collapse = "+")))
+
+
+# create a grid with tuning parameters
+tuning.params <- expand.grid(
+  shrinkage = c(0.01, .1, 0.5),
+  n.minobsinnode = c(100, 200, 500),
+  interaction.depth = c(1,2,3),
+  bag.fraction = c(0.8, 0.9),
+  optimal_trees = 0,               # a place to dump results
+  min_RMSE = 0                     # a place to dump results
+)
+
+#tuning by trial and error
+start.time <- Sys.time()
+for(i in 1:nrow(tuning.params)) {
+  set.seed(123)# reproducibility
+  cat("\014")
+  print(paste0("Iteration ",i," of ",nrow(tuning.params)))
+  print(difftime(Sys.time(),start.time))
+  # train model
+  gbm.tune <- gbm(
+    formula = fml.gbm1,
+    distribution = "gaussian", 
+    data = train,
+    n.trees = 850,
+    interaction.depth = tuning.params$interaction.depth[i],
+    shrinkage = tuning.params$shrinkage[i],
+    n.minobsinnode = tuning.params$n.minobsinnode[i],
+    bag.fraction = tuning.params$bag.fraction[i],
+    train.fraction = .70,
+    n.cores = 30, #default uses all cores
+    verbose = FALSE
+  )
+  
+  # add min training error and trees to grid
+  tuning.params$optimal_trees[i] <- which.min(gbm.tune$valid.error)
+  tuning.params$min_RMSE[i] <- sqrt(min(gbm.tune$valid.error))
+}
+
+write.csv(tuning.params, file = "Results/table11.csv")
+
+
+# developing the final training model with five fold CV.
+
+```
+
+```{r gbm1-cv}
+
+load("CO Raw Data/Cleaned/50DTC_50Percent.RData")
+
+#splitting data into training and testing sets
+br <- rep(c(1:10),length.out = nrow(stratified))
+set.seed(100)
+br <- sample(br)
+stratified$V_OEM <- as.factor(stratified$V_OEM)
+train <- dplyr::filter(stratified, br <=  7)
+test <- dplyr::filter(stratified, br > 7)
+
+# identifying regressors
+cn <- colnames(stratified)
+rm(stratified)
+ncode <- 50  #how many DTC's to include
+cn <- cn[c(6:10,12,14,25,31,47:(46+ncode))]
+
+
+fml.gbm1 <- as.formula(paste0(
+  "V_IM240_FAIL ~ ",paste0(cn, collapse = "+")))
+
+
+splt <- rep(c(1:5), length.out = nrow(train))
+set.seed(400)
+splt <- sample(splt)
+y <- vector(length = 0)
+yhat <- vector(length = 0)
+
+start.time <- Sys.time()
+for(i in 1:5){
+  cat("\014")
+  print(paste0("Iteration #",i," of 5."))
+  print(difftime(Sys.time(),start.time))
+  trn.cv <- dplyr::filter(train, splt!= i)
+  tst.cv <- dplyr::filter(train, splt == i)
+  
+  gbm.cv <- gbm(
+    formula = fml.gbm1,
+    distribution = "gaussian", 
+    data = trn.cv,
+    n.trees = 850,
+    interaction.depth = 3,
+    shrinkage = 0.5,
+    n.minobsinnode = 100,
+    bag.fraction = 0.9,
+    n.cores = 30, #default uses all cores
+    verbose = FALSE
+  )
+  
+  y <- c(y,tst.cv$V_IM240_FAIL)
+  yhat <- c(yhat, predict(gbm.cv, newdata = tst.cv, n.trees = 850))
+}
+
+error <- prediction(yhat, y)
+perf <- performance(error, measure="tpr", x.measure="fpr")
+
+opt.cut = function(perf, pred){
+  cut.ind = mapply(FUN=function(x, y, p){
+    d = (x - 0)^2 + (y-1)^2
+    ind = which(d == min(d))
+    c(sensitivity = y[[ind]], specificity = 1-x[[ind]], 
+      cutoff = p[[ind]])
+  }, perf@x.values, perf@y.values, pred@cutoffs)
+}
+
+cutpoint <-  as.data.frame(
+  opt.cut(perf,error))[3,1]
+
+png("Results/Figure5.png")
+
+plot(perf, 
+     avg = 'threshold', 
+     spread.estimate = 'stddev',
+     print.cutoffs.at = seq(cutpoint - 0.2,
+                            cutpoint + 0.2, 
+                            by = 0.2),
+     text.adj = c(-.5, 1.2), 
+     main = "") 
+
+abline(0,1)
+
+dev.off()
+
+
+```
+
+## 9. Model III - Two-level GB 
+
+### Tuning individual components like.
+
+```{r gbm2-tune}
+
+load("CO Raw Data/Cleaned/50DTC_50Percent.RData")
+
+#splitting data into training and testing sets
+br <- rep(c(1:10),length.out = nrow(stratified))
+set.seed(100)
+br <- sample(br)
+stratified$V_OEM <- as.factor(stratified$V_OEM)
+train <- dplyr::filter(stratified, br <=  7)
+test <- dplyr::filter(stratified, br > 7)
+
+# identifying regressors
+cn <- colnames(stratified)
+rm(stratified)
+ncode <- 50  #how many DTC's to include
+cn <- cn[c(6:10,12,14,25,31,47:(46+ncode))]
+
+
+fml.gbm1 <- as.formula(paste0(
+  "V_NOX_RES ~ ",paste0(cn, collapse = "+")))
+
+
+# create a grid with tuning parameters
+tuning.params <- expand.grid(
+  shrinkage = c(0.01, .1, 0.5),
+  n.minobsinnode = c(100, 200, 500),
+  interaction.depth = c(1,2,3),
+  bag.fraction = c(0.8, 0.9),
+  optimal_trees = 0,               # a place to dump results
+  min_RMSE = 0                     # a place to dump results
+)
+
+#tuning by trial and error
+start.time <- Sys.time()
+for(i in 1:nrow(tuning.params)) {
+  set.seed(123)# reproducibility
+  cat("\014")
+  print(paste0("NOX Iteration ",i," of ",nrow(tuning.params)))
+  print(difftime(Sys.time(),start.time))
+  # train model
+  gbm.tune <- gbm(
+    formula = fml.gbm1,
+    distribution = "gaussian", 
+    data = train,
+    n.trees = 850,
+    interaction.depth = tuning.params$interaction.depth[i],
+    shrinkage = tuning.params$shrinkage[i],
+    n.minobsinnode = tuning.params$n.minobsinnode[i],
+    bag.fraction = tuning.params$bag.fraction[i],
+    train.fraction = .70,
+    n.cores = 30, #default uses all cores
+    verbose = FALSE
+  )
+  
+  # add min training error and trees to grid
+  tuning.params$optimal_trees[i] <- which.min(gbm.tune$valid.error)
+  tuning.params$min_RMSE[i] <- sqrt(min(gbm.tune$valid.error))
+}
+
+write.csv(tuning.params, file = "Results/table12.csv")
+
+
+################################
+
+
+fml.gbm1 <- as.formula(paste0(
+  "V_CO_RES ~ ",paste0(cn, collapse = "+")))
+
+
+# create a grid with tuning parameters
+tuning.params <- expand.grid(
+  shrinkage = c(0.01, .1, 0.5),
+  n.minobsinnode = c(100, 200, 500),
+  interaction.depth = c(1,2,3),
+  bag.fraction = c(0.8, 0.9),
+  optimal_trees = 0,               # a place to dump results
+  min_RMSE = 0                     # a place to dump results
+)
+
+#tuning by trial and error
+start.time <- Sys.time()
+for(i in 1:nrow(tuning.params)) {
+  set.seed(123)# reproducibility
+  cat("\014")
+  print(paste0("CO: Iteration ",i," of ",nrow(tuning.params)))
+  print(difftime(Sys.time(),start.time))
+  # train model
+  gbm.tune <- gbm(
+    formula = fml.gbm1,
+    distribution = "gaussian", 
+    data = train,
+    n.trees = 850,
+    interaction.depth = tuning.params$interaction.depth[i],
+    shrinkage = tuning.params$shrinkage[i],
+    n.minobsinnode = tuning.params$n.minobsinnode[i],
+    bag.fraction = tuning.params$bag.fraction[i],
+    train.fraction = .70,
+    n.cores = 30, #default uses all cores
+    verbose = FALSE
+  )
+  
+  # add min training error and trees to grid
+  tuning.params$optimal_trees[i] <- which.min(gbm.tune$valid.error)
+  tuning.params$min_RMSE[i] <- sqrt(min(gbm.tune$valid.error))
+}
+
+write.csv(tuning.params, file = "Results/table13.csv")
+
+
+##########################################################
+
+fml.gbm1 <- as.formula(paste0(
+  "V_HC_RES ~ ",paste0(cn, collapse = "+")))
+
+
+# create a grid with tuning parameters
+tuning.params <- expand.grid(
+  shrinkage = c(0.01, .1, 0.5),
+  n.minobsinnode = c(100, 200, 500),
+  interaction.depth = c(1,2,3),
+  bag.fraction = c(0.8, 0.9),
+  optimal_trees = 0,               # a place to dump results
+  min_RMSE = 0                     # a place to dump results
+)
+
+#tuning by trial and error
+start.time <- Sys.time()
+for(i in 1:nrow(tuning.params)) {
+  set.seed(123)# reproducibility
+  cat("\014")
+  print(paste0("HC: Iteration ",i," of ",nrow(tuning.params)))
+  print(difftime(Sys.time(),start.time))
+  # train model
+  gbm.tune <- gbm(
+    formula = fml.gbm1,
+    distribution = "gaussian", 
+    data = train,
+    n.trees = 850,
+    interaction.depth = tuning.params$interaction.depth[i],
+    shrinkage = tuning.params$shrinkage[i],
+    n.minobsinnode = tuning.params$n.minobsinnode[i],
+    bag.fraction = tuning.params$bag.fraction[i],
+    train.fraction = .70,
+    n.cores = 30, #default uses all cores
+    verbose = FALSE
+  )
+  
+  # add min training error and trees to grid
+  tuning.params$optimal_trees[i] <- which.min(gbm.tune$valid.error)
+  tuning.params$min_RMSE[i] <- sqrt(min(gbm.tune$valid.error))
+}
+
+write.csv(tuning.params, file = "Results/table14.csv")
+
+
+
+
+```
+
+
+
+## Cross-Val GBM2 Model.
+
+```{r gbm2-crossval}
+
+load("CO Raw Data/Cleaned/50DTC_50Percent.RData")
+
+#splitting data into training and testing sets
+br <- rep(c(1:10),length.out = nrow(stratified))
+set.seed(100)
+br <- sample(br)
+stratified$V_OEM <- as.factor(stratified$V_OEM)
+train <- dplyr::filter(stratified, br <=  7)
+test <- dplyr::filter(stratified, br > 7)
+
+# identifying regressors
+cn <- colnames(stratified)
+rm(stratified)
+ncode <- 50  #how many DTC's to include
+cn <- cn[c(6:10,12,14,25,31,47:(46+ncode))]
+
+splt <- rep(c(1:5), length.out = nrow(train))
+set.seed(400)
+splt <- sample(splt)
+
+
+##########NOX
+y <- vector(length = 0)
+yhat <- vector(length = 0)
+
+fml.gbm1 <- as.formula(paste0(
+  "V_NOX_RES ~ ",paste0(cn, collapse = "+")))
+
+
+start.time <- Sys.time()
+for(i in 1:5){
+  cat("\014")
+  print(paste0("Iteration #",i," of 5."))
+  print(difftime(Sys.time(),start.time))
+  trn.cv <- dplyr::filter(train, splt!= i)
+  tst.cv <- dplyr::filter(train, splt == i)
+  
+  gbm.cv <- gbm(
+    formula = fml.gbm1,
+    distribution = "gaussian", 
+    data = trn.cv,
+    n.trees = 850,
+    interaction.depth = 3,
+    shrinkage = 0.5,
+    n.minobsinnode = 100,
+    bag.fraction = 0.8,
+    n.cores = 30, #default uses all cores
+    verbose = FALSE
+  )
+  
+  y <- c(y,tst.cv$V_NOX_RES)
+  yhat <- c(yhat, predict(gbm.cv, newdata = tst.cv, n.trees = 850))
+}
+
+error <- prediction(yhat, y)
+perf <- performance(error, measure="tpr", x.measure="fpr")
+
+opt.cut = function(perf, pred){
+  cut.ind = mapply(FUN=function(x, y, p){
+    d = (x - 0)^2 + (y-1)^2
+    ind = which(d == min(d))
+    c(sensitivity = y[[ind]], specificity = 1-x[[ind]], 
+      cutoff = p[[ind]])
+  }, perf@x.values, perf@y.values, pred@cutoffs)
+}
+
+cutpoint <-  as.data.frame(
+  opt.cut(perf,error))[3,1]
+
+png("Results/Figure6.png")
+
+plot(perf, 
+     avg = 'threshold', 
+     spread.estimate = 'stddev',
+     print.cutoffs.at = seq(cutpoint - 0.2,
+                            cutpoint + 0.2, 
+                            by = 0.2),
+     text.adj = c(-.5, 1.2), 
+     main = "") 
+
+abline(0,1)
+
+dev.off()
+
+
+############ CO
+
+y <- vector(length = 0)
+yhat <- vector(length = 0)
+
+fml.gbm1 <- as.formula(paste0(
+  "V_CO_RES ~ ",paste0(cn, collapse = "+")))
+
+
+start.time <- Sys.time()
+for(i in 1:5){
+  cat("\014")
+  print(paste0("Iteration #",i," of 5."))
+  print(difftime(Sys.time(),start.time))
+  trn.cv <- dplyr::filter(train, splt!= i)
+  tst.cv <- dplyr::filter(train, splt == i)
+  
+  gbm.cv <- gbm(
+    formula = fml.gbm1,
+    distribution = "gaussian", 
+    data = trn.cv,
+    n.trees = 850,
+    interaction.depth = 3,
+    shrinkage = 0.5,
+    n.minobsinnode = 100,
+    bag.fraction = 0.9,
+    n.cores = 30, #default uses all cores
+    verbose = FALSE
+  )
+  
+  y <- c(y,tst.cv$V_CO_RES)
+  yhat <- c(yhat, predict(gbm.cv, newdata = tst.cv, n.trees = 850))
+}
+
+error <- prediction(yhat, y)
+perf <- performance(error, measure="tpr", x.measure="fpr")
+
+opt.cut = function(perf, pred){
+  cut.ind = mapply(FUN=function(x, y, p){
+    d = (x - 0)^2 + (y-1)^2
+    ind = which(d == min(d))
+    c(sensitivity = y[[ind]], specificity = 1-x[[ind]], 
+      cutoff = p[[ind]])
+  }, perf@x.values, perf@y.values, pred@cutoffs)
+}
+
+cutpoint <-  as.data.frame(
+  opt.cut(perf,error))[3,1]
+
+png("Results/Figure7.png")
+
+plot(perf, 
+     avg = 'threshold', 
+     spread.estimate = 'stddev',
+     print.cutoffs.at = seq(cutpoint - 0.2,
+                            cutpoint + 0.2, 
+                            by = 0.2),
+     text.adj = c(-.5, 1.2), 
+     main = "") 
+
+abline(0,1)
+
+dev.off()
+
+
+
+############ HC
+
+y <- vector(length = 0)
+yhat <- vector(length = 0)
+
+fml.gbm1 <- as.formula(paste0(
+  "V_HC_RES ~ ",paste0(cn, collapse = "+")))
+
+
+start.time <- Sys.time()
+for(i in 1:5){
+  cat("\014")
+  print(paste0("Iteration #",i," of 5."))
+  print(difftime(Sys.time(),start.time))
+  trn.cv <- dplyr::filter(train, splt!= i)
+  tst.cv <- dplyr::filter(train, splt == i)
+  
+  gbm.cv <- gbm(
+    formula = fml.gbm1,
+    distribution = "gaussian", 
+    data = trn.cv,
+    n.trees = 850,
+    interaction.depth = 3,
+    shrinkage = 0.5,
+    n.minobsinnode = 200,
+    bag.fraction = 0.9,
+    n.cores = 30, #default uses all cores
+    verbose = FALSE
+  )
+  
+  y <- c(y,tst.cv$V_HC_RES)
+  yhat <- c(yhat, predict(gbm.cv, newdata = tst.cv, n.trees = 850))
+}
+
+error <- prediction(yhat, y)
+perf <- performance(error, measure="tpr", x.measure="fpr")
+
+opt.cut = function(perf, pred){
+  cut.ind = mapply(FUN=function(x, y, p){
+    d = (x - 0)^2 + (y-1)^2
+    ind = which(d == min(d))
+    c(sensitivity = y[[ind]], specificity = 1-x[[ind]], 
+      cutoff = p[[ind]])
+  }, perf@x.values, perf@y.values, pred@cutoffs)
+}
+
+cutpoint <-  as.data.frame(
+  opt.cut(perf,error))[3,1]
+
+png("Results/Figure8.png")
+
+plot(perf, 
+     avg = 'threshold', 
+     spread.estimate = 'stddev',
+     print.cutoffs.at = seq(cutpoint - 0.2,
+                            cutpoint + 0.2, 
+                            by = 0.2),
+     text.adj = c(-.5, 1.2), 
+     main = "") 
+
+abline(0,1)
+
+dev.off()
+
+
+
+
+```
+
+
+
+## 10. Final Predictions: All Models
+
+```{r logregpred}
+
+load("CO Raw Data/Cleaned/50DTC_50Percent.RData")
+
+#splitting data into training and testing sets
+br <- rep(c(1:10),length.out = nrow(stratified))
+set.seed(100)
+br <- sample(br)
+stratified$V_OEM <- as.factor(stratified$V_OEM)
+train <- dplyr::filter(stratified, br <=  7)
+test <- dplyr::filter(stratified, br > 7)
+
+y <- cbind.data.frame(test$V_OBD_MIL, test$V_IM240_FAIL, test$V_NOX_RES, 
+           test$V_CO_RES, test$V_HC_RES)
+
+# identifying regressors
+cn <- colnames(stratified)
+rm(stratified)
+ncode <- 50  #how many DTC's to include
+
+
+cn1 <- cn[c(6:10,12,14,25,31,47:(46+ncode))]
+
+# adding  interaction terms
+cn1 <-  c(cn1, "V_ODOMETER/V_AGE",
+         "V_OEM * V_TR_NO","V_OEM * V_AGE")
+
+#selecting regressors for other models
+cn2 <-  cn1[c(2:60,62)] #without MIL or OEM
+cn3 <- cn1[c(10:60)] #DTC's ONLY
+
+# regression equation
+fml.logreg1 <- as.formula(paste0(
+  "V_IM240_FAIL ~ ",paste0(cn1, collapse = "+")))
+fml.logreg2 <- as.formula(paste0(
+  "V_IM240_FAIL ~ ",paste0(cn2, collapse = "+")))
+fml.logreg3 <- as.formula(paste0(
+  "V_IM240_FAIL ~ ",paste0(cn3, collapse = "+")))
+
+  logreg1 <- glm(fml.logreg1, data = train,
+                     family = binomial(link = "logit"))
+  logreg2 <- glm(fml.logreg2, data = train,
+                     family = binomial(link = "logit"))
+  logreg3 <- glm(fml.logreg3, data = train,
+                     family = binomial(link = "logit"))
+  yhat1 <- predict(logreg1, newdata = test,
+                            type = "response")
+  yhat1log <- 1* (yhat1 >= 0.50)
+  yhat2 <-  predict(logreg2, newdata = test,
+                            type = "response")
+  yhat2log <- 1* (yhat2 >= 0.49)
+  yhat3 <-  predict(logreg3, newdata = test,
+                            type = "response")
+  yhat3log <- 1* (yhat3 >= 0.383)
+  
+y <- cbind.data.frame(y, yhat1, yhat1log, yhat2, yhat2log, 
+                      yhat3, yhat3log)
+
+rm(logreg1, logreg2, logreg3)
+
+cn <- colnames(train)
+
+cn <- cn[c(6:10,12,14,25,31,47:(46+ncode))]
+fml.gbm1 <- as.formula(paste0(
+  "V_IM240_FAIL ~ ",paste0(cn, collapse = "+")))
+gbm1 <- gbm(
+    formula = fml.gbm1,
+    distribution = "gaussian", 
+    data = train,
+    n.trees = 850,
+    interaction.depth = 3,
+    shrinkage = 0.5,
+    n.minobsinnode = 100,
+    bag.fraction = 0.9,
+    n.cores = 30, #default uses all cores
+    verbose = FALSE
+  )
+
+yhat.gbm1 <- predict(gbm1, newdata = test, 
+                     n.trees = 850)
+yhatgbm1cat <- 1*(yhat.gbm1 >= 0.55)
+y <- cbind.data.frame(y, yhat.gbm1, yhatgbm1cat)
+
+rm(gbm1)
+
+############ Predicting Two Step ################
+
+fml.gbm1 <- as.formula(paste0(
+  "V_NOX_RES ~ ",paste0(cn, collapse = "+")))
+gbm.nox <- gbm(
+    formula = fml.gbm1,
+    distribution = "gaussian", 
+    data = train,
+    n.trees = 850,
+    interaction.depth = 3,
+    shrinkage = 0.5,
+    n.minobsinnode = 100,
+    bag.fraction = 0.8,
+    n.cores = 30, #default uses all cores
+    verbose = FALSE
+  )
+
+yhatnox <- predict(gbm.nox, newdata = test, n.trees = 850)
+yhatnoxcat <- 1* (yhatnox >= 0.41)
+y <- cbind.data.frame(y, yhatnox, yhatnoxcat)
+
+
+###### CO
+
+fml.gbm1 <- as.formula(paste0(
+  "V_CO_RES ~ ",paste0(cn, collapse = "+")))
+  gbm.co <- gbm(
+    formula = fml.gbm1,
+    distribution = "gaussian", 
+    data = train,
+    n.trees = 850,
+    interaction.depth = 3,
+    shrinkage = 0.5,
+    n.minobsinnode = 100,
+    bag.fraction = 0.9,
+    n.cores = 30, #default uses all cores
+    verbose = FALSE
+  )
+  
+    
+yhatco <- predict(gbm.co, newdata = test,n.trees = 850)
+yhatcocat <- 1* (yhatco >= 0.21)
+y <- cbind.data.frame(y, yhatco, yhatcocat)
+  
+########## HCX
+  
+  fml.gbm1 <- as.formula(paste0(
+  "V_HC_RES ~ ",paste0(cn, collapse = "+")))
+  
+    gbm.hc <- gbm(
+    formula = fml.gbm1,
+    distribution = "gaussian", 
+    data = train,
+    n.trees = 850,
+    interaction.depth = 3,
+    shrinkage = 0.5,
+    n.minobsinnode = 200,
+    bag.fraction = 0.9,
+    n.cores = 30, #default uses all cores
+    verbose = FALSE
+  )
+
+yhathc <- predict(gbm.co, newdata = test, n.trees = 850)
+yhathccat <- 1* (yhatco >= 0.21)
+y <- cbind.data.frame(y, yhathc, yhathccat)
+
+write.csv(y, "Results/final_preds.csv")
+
+
+```
+
+
+
+11. Looking further into the NOx Model
+
+```{r NOXanalysis}
+
+load("CO Raw Data/Cleaned/50DTC_50Percent.RData")
+
+#splitting data into training and testing sets
+br <- rep(c(1:10),length.out = nrow(stratified))
+set.seed(100)
+br <- sample(br)
+stratified$V_OEM <- as.factor(stratified$V_OEM)
+train <- dplyr::filter(stratified, br <=  7)
+test <- dplyr::filter(stratified, br > 7)
+
+y <- cbind.data.frame(test$V_AGE, test$V_ODOMETER, test$V_OBD_MIL, test$V_NOX_RES, test$V_NOX_GRAMS, test$V_NOX_STD)
+colnames(y) <- c("AGE", "ODOMETER", "MIL", "NOX_RES", "GRAMS", "STD")
+y$MILES_PER_YEAR <- y$ODOMETER/y$AGE
+y$GRAMS_ABOVE <- y$GRAMS - y$STD
+y$PERC_ABOVE <- y$GRAMS_ABOVE*100/y$STD
+
+# identifying regressors
+rm(stratified)
+ncode <- 50  #how many DTC's to include
+cn <- colnames(train)
+cn <- cn[c(6:10,12,14,25,31,47:(46+ncode))]
+
+fml.gbm1 <- as.formula(paste0(
+  "V_NOX_RES ~ ",paste0(cn, collapse = "+")))
+gbm.nox <- gbm(
+    formula = fml.gbm1,
+    distribution = "gaussian", 
+    data = train,
+    n.trees = 850,
+    interaction.depth = 3,
+    shrinkage = 0.5,
+    n.minobsinnode = 100,
+    bag.fraction = 0.8,
+    n.cores = 30, #default uses all cores
+    verbose = FALSE
+  )
+PRED_PROB <- predict(gbm.nox, newdata = test, n.trees = 850)
+PRED_RES <- 1* (PRED_PROB >= 0.41)
+y <- cbind.data.frame(y, PRED_PROB, PRED_RES)
+
+rm(gbm.nox, train, br, cn, fml.gbm1, ncode, PRED_PROB, PRED_RES)
+
+
+#FIRST: Just Histograms
+
+y_fail <-  dplyr::filter(y, y$NOX_RES == 1)
+OBD_false_pass <- dplyr::filter(y_fail, y_fail$MIL == 0)
+GBM_false_pass <- dplyr::filter(y_fail, y_fail$PRED_RES == 0)
+OBD_fail_ident <- dplyr::filter(y_fail, y_fail$MIL == 1)
+GBM_fail_ident <- dplyr::filter(y_fail, y_fail$PRED_RES == 1)
+
+par(mfrow = c(3,2))
+
+hist(y_fail$PERC_ABOVE, breaks = "Scott")
+hist(OBD_false_pass$PERC_ABOVE, breaks = "Scott")
+hist(GBM_false_pass$PERC_ABOVE, breaks = "Scott")
+hist(OBD_fail_ident$PERC_ABOVE, breaks = "Scott")
+hist(GBM_fail_ident$PERC_ABOVE, breaks = "Scott")
+
+write.csv(y, "for_nox_analysis.csv", 
+          row.names = F)
+
+rm(list = ls())
+
+```
+
+Okay, let's do the monte-carlo loop.
+
+```{r montecarlo}
+
+raw <- read.csv("for_nox_analysis.csv")
+survivability <- read.csv("survivability.csv")
+
+miles_per <- function(odo = 100000, age = 10, year = -2){
+  
+  if (age == 0){
+    return(0)
+  }
+
+  else if(age + year < 0){
+    return(0)
+  }
+  
+  else if (age + year >= 0){
+    miles <- rnorm(1, mean = (odo/age), sd = (odo/age)*0.033)
+    miles <- round(miles, digits = 0)
+    return(miles)
+  }
+    
+}
+
+scrap_veh <- function(age = 15){
+  if(age < 1){
+    return (0)
+  }
+  else if(age > 20){
+    return (1)
+  }
+  else if(age >= 1 && age <=  20){
+    return(rbinom(n = 1, size = 1, prob =  (
+      1 - survivability[age,2])))
+  }
+}
+
+grams_after <- function(scrap = 1, grams = 30, 
+                        std = 22, fail = 1){
+  if(fail == 0 || grams <= std){
+    return(grams)
+  }
+  else if(scrap == 1){
+    return(1.5)
+  }
+  else{
+    return(std)
+  }
+    
+}    
+
+raw <- filter(raw, raw$NOX_RES == 1)
+
+### For the MIL
+
+raw$FAIL<- raw$MIL
+run <- c(1:100)
+before <- vector(length = 100)
+after <- vector(length = 100)
+start.time <- Sys.time()
+for (i in  1:100){
+  cat("\014")
+  print(paste0("Simulation #",i," of 100 for OBD."))
+  print(difftime(Sys.time(),start.time))
+  raw$MILES_TWO_YEARS_PRIOR <- mcmapply(miles_per, raw$ODOMETER, 
+                                    raw$AGE, -2)
+  raw$MILES_ONE_YEAR_PRIOR <- mcmapply(miles_per, raw$ODOMETER, 
+                                    raw$AGE, -1)
+  raw$MILES_ONE_YEAR_AFTER <- mcmapply(miles_per, raw$ODOMETER, 
+                                    raw$AGE, 0)
+  raw$MILES_TWO_YEARS_AFTER <- mcmapply(miles_per, raw$ODOMETER, 
+                                    raw$AGE, 1)
+  raw$GRAMS_PER_MILE_BEFORE <-  raw$GRAMS
+  
+  raw$SCRAP <- mapply(scrap_veh, raw$AGE)
+  
+  raw$GRAMS_PER_MILE_AFTER <- mcmapply(grams_after, raw$SCRAP, raw$GRAMS, raw$STD, raw$FAIL)
+  
+  TOTAL_MILES_PRIOR <- sum(raw$MILES_TWO_YEARS_PRIOR) + sum(raw$MILES_ONE_YEAR_PRIOR)
+  TOTAL_MILES_AFTER <- sum(raw$MILES_ONE_YEAR_AFTER) + sum(raw$MILES_TWO_YEARS_AFTER)
+  
+  raw$OVERALL_GRAMS_PRIOR <- (raw$MILES_TWO_YEARS_PRIOR + raw$MILES_ONE_YEAR_PRIOR)* raw$GRAMS_PER_MILE_BEFORE
+  TOTAL_GRAMS_PRIOR <- sum(raw$OVERALL_GRAMS_PRIOR)
+  raw$OVERALL_GRAMS_AFTER <- (raw$MILES_TWO_YEARS_AFTER + raw$MILES_ONE_YEAR_AFTER)* raw$GRAMS_PER_MILE_AFTER
+  TOTAL_GRAMS_AFTER <- sum (raw$OVERALL_GRAMS_AFTER)
+  
+  before[i] <- TOTAL_GRAMS_PRIOR/TOTAL_MILES_PRIOR
+  after[i] <- TOTAL_GRAMS_AFTER/TOTAL_MILES_AFTER
+}
+
+res <- cbind.data.frame(run, before, after)
+colnames(res) <- c("Run #", "Before_OBD", "After_OBD")
+
+# Let's try to recreate this loop for our NOX model
+
+for(j in 4:9){
+raw$FAIL<- (raw$PRED_PROB >= j/10)*1
+before <- vector(length = 100)
+after <- vector(length = 100)
+
+for (i in  1:100){
+  cat("\014")
+  print(paste0("Simulation #",i," of 100 for NOx Model with threshold ",(j/10),"."))
+    print(difftime(Sys.time(),start.time))
+  raw$MILES_TWO_YEARS_PRIOR <- mcmapply(miles_per, raw$ODOMETER, 
+                                    raw$AGE, -2)
+  raw$MILES_ONE_YEAR_PRIOR <- mcmapply(miles_per, raw$ODOMETER, 
+                                    raw$AGE, -1)
+  raw$MILES_ONE_YEAR_AFTER <- mcmapply(miles_per, raw$ODOMETER, 
+                                    raw$AGE, 0)
+  raw$MILES_TWO_YEARS_AFTER <- mcmapply(miles_per, raw$ODOMETER, 
+                                    raw$AGE, 1)
+  raw$GRAMS_PER_MILE_BEFORE <-  raw$GRAMS
+  
+  raw$SCRAP <- mapply(scrap_veh, raw$AGE)
+  
+  raw$GRAMS_PER_MILE_AFTER <- mcmapply(grams_after, raw$SCRAP, raw$GRAMS, raw$STD, raw$FAIL)
+  
+  TOTAL_MILES_PRIOR <- sum(raw$MILES_TWO_YEARS_PRIOR) + sum(raw$MILES_ONE_YEAR_PRIOR)
+  TOTAL_MILES_AFTER <- sum(raw$MILES_ONE_YEAR_AFTER) + sum(raw$MILES_TWO_YEARS_AFTER)
+  
+  raw$OVERALL_GRAMS_PRIOR <- (raw$MILES_TWO_YEARS_PRIOR + raw$MILES_ONE_YEAR_PRIOR)* raw$GRAMS_PER_MILE_BEFORE
+  TOTAL_GRAMS_PRIOR <- sum(raw$OVERALL_GRAMS_PRIOR)
+  raw$OVERALL_GRAMS_AFTER <- (raw$MILES_TWO_YEARS_AFTER + raw$MILES_ONE_YEAR_AFTER)* raw$GRAMS_PER_MILE_AFTER
+  TOTAL_GRAMS_AFTER <- sum (raw$OVERALL_GRAMS_AFTER)
+  
+  before[i] <- TOTAL_GRAMS_PRIOR/TOTAL_MILES_PRIOR
+  after[i] <- TOTAL_GRAMS_AFTER/TOTAL_MILES_AFTER
+}
+
+this_res <- cbind.data.frame(before,after)
+colnames(this_res) <- c(paste("BEFORE_MODEL_",j),paste("AFTER_MODEL_",j))
+res <- cbind.data.frame(res, this_res)
+
+}
+
+write.csv(res, "for_boxplot_nox.csv", row.names = F)
+```
+
+
+## 13. Policy Lever 2 - High Efficiency Vehicles
+
+```{r lever2}
+
+load("CO Raw Data/Cleaned/50DTC_50Percent.RData")
+
+#splitting data into training and testing sets
+br <- rep(c(1:10),length.out = nrow(stratified))
+set.seed(100)
+br <- sample(br)
+stratified$V_OEM <- as.factor(stratified$V_OEM)
+train <- dplyr::filter(stratified, br <=  7)
+test <- dplyr::filter(stratified, br > 7)
+r <- cbind.data.frame(test$V_MPG, test$V_IM240_FAIL)
+rm(train,test,br,stratified)
+
+colnames(r) <-  c("MPG", "IM240Fail")
+v <- aggregate(IM240Fail ~ MPG, data = r, mean)
+
+```
